@@ -1,118 +1,65 @@
-import os
-import csv
-import json
-import time
-import random
-import requests
 import pandas as pd
-from bs4 import BeautifulSoup
-from fake_useragent import UserAgent
+import re
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import classification_report, confusion_matrix
+import os
+import joblib
 
-save_path = 'data/raw/all_reviews.csv'
-target_per_domain = 600
-timeout = 15
-delay = (2, 4)  # случайная задержка
+# читаем данные
+df = pd.read_csv('data/raw/all_reviews.csv', sep=';')
+print('всего отзывов:', len(df))
+print('оценки:\n', df['rating'].value_counts().sort_index())
 
-targets = [
-    "www.apple.com", "www.samsung.com", "www.canon.com",
-    "www.adobe.com", "www.microsoft.com", "www.sony.com",
-    "www.deliveroo.com", "www.starbucks.com", "www.uber.com",
-    "www.booking.com", "www.hotels.com", "www.tripadvisor.com"
-]
+# оставляем только 1,2 и 4,5 (тройки выкидываем)
+df = df[df['rating'].isin([1,2,4,5])]
+# позитив = 1 если оценка 4 или 5, иначе 0
+df['sentiment'] = (df['rating'] >= 4).astype(int)
+print('\nпосле фильтрации:\n', df['sentiment'].value_counts())
 
-def save_csv(reviews):
-    """сохраняет отзывы в csv"""
-    exists = os.path.isfile(save_path)
-    with open(save_path, 'a', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f, delimiter=';')
-        if not exists:
-            writer.writerow(['rating', 'text', 'source'])
-        writer.writerows(reviews)
+# чистка текста
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'[^a-zA-Z\s]', '', text)
+    return ' '.join(text.split())
 
-def get_page(url, ua, retries=3):
-    """загружает страницу, меняет юзер-агент, при ошибках повторяет"""
-    for attempt in range(retries):
-        try:
-            headers = {'User-Agent': ua.random}
-            r = requests.get(url, headers=headers, timeout=timeout)
-            if r.status_code == 200:
-                return r
-            elif r.status_code == 403:
-                print("  доступ запрещён (403), maybe бан")
-                return None
-            else:
-                print(f"  статус {r.status_code}, попытка {attempt+1}/{retries}")
-        except Exception as e:
-            print(f"  ошибка: {e}, попытка {attempt+1}/{retries}")
-        time.sleep(2**attempt)
-    return None
+df['clean_text'] = df['text'].apply(clean_text)
+df = df[df['clean_text'].str.strip() != '']
+print('осталось после чистки:', len(df))
 
-def parse_trustpilot(domain, limit):
-    """собирает отзывы с trustpilot для одного домена"""
-    collected = 0
-    page = 1
-    ua = UserAgent()
-    print(f"\n--> парсим {domain}, цель {limit}")
+X = df['clean_text']
+y = df['sentiment']
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+print(f'\nтренировочных: {len(X_train)}, тестовых: {len(X_test)}')
 
-    while collected < limit:
-        url = f"https://www.trustpilot.com/review/{domain}?page={page}"
-        resp = get_page(url, ua)
-        if not resp:
-            break
+model = Pipeline([
+    ('tfidf', TfidfVectorizer(max_features=5000, ngram_range=(1,2))),
+    ('clf', LogisticRegression(class_weight='balanced', max_iter=1000, random_state=42))
+])
 
-        try:
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            script = soup.find('script', id='__NEXT_DATA__')
-            if not script:
-                print("  нет данных, maybe конец")
-                break
+model.fit(X_train, y_train)
 
-            data = json.loads(script.string)
-            reviews = data.get('props', {}).get('pageProps', {}).get('reviews', [])
-            if not reviews:
-                print("  отзывы кончились")
-                break
+y_pred = model.predict(X_test)
+print('\n' + '-'*40)
+print('отчёт по классам')
+print('-'*40)
+print(classification_report(y_test, y_pred, target_names=['негатив', 'позитив']))
 
-            batch = []
-            for rev in reviews:
-                text = rev.get('text', '').replace('\n', ' ').strip()
-                rating = rev.get('rating')
-                if text and rating is not None:
-                    batch.append([rating, text, 'trustpilot'])
-                    collected += 1
+cm = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(5,4))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['негатив', 'позитив'], yticklabels=['негатив', 'позитив'])
+plt.ylabel('реальный')
+plt.xlabel('предсказанный')
+plt.title('матрица ошибок')
+plt.show()
 
-            if batch:
-                save_csv(batch)
-                print(f"  страница {page}: +{len(batch)} отзывов (всего {collected})")
-            else:
-                print(f"  страница {page}: пусто")
-
-            page += 1
-            time.sleep(random.uniform(*delay))
-
-        except Exception as e:
-            print(f"  ошибка при обработке: {e}")
-            break
-    return collected
-
-def remove_dupes():
-    """удаляет дубликаты по тексту"""
-    if not os.path.exists(save_path):
-        print("файла нет, чистить нечего")
-        return
-    df = pd.read_csv(save_path, sep=';')
-    before = len(df)
-    df.drop_duplicates(subset=['text'], inplace=True)
-    df.to_csv(save_path, index=False, sep=';')
-    print(f"дубликатов удалено: {before - len(df)}")
-
-
-if __name__ == "__main__":
-    os.makedirs('data/raw', exist_ok=True)
-    total = 0
-    for site in targets:
-        total += parse_trustpilot(site, target_per_domain)
-        print(f"пока собрано {total} отзывов")
-
-    remove_dupes()
-    print("готово!")
+os.makedirs('models', exist_ok=True)
+joblib.dump(model, 'models/sentiment_model.pkl')
+print('модель сохранена в models/sentiment_model.pkl')
